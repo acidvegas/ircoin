@@ -765,6 +765,33 @@ class IRCoinBot(BaseBot):
 
         cmd = parts[0].lower()
 
+        if cmd == 'buy':
+            pct = random.uniform(1, 3)
+            wallet = self.data['wallets'].get(nl, {})
+            top_coin = None
+            top_val = 0.0
+            for coin, amt in wallet.items():
+                val = amt * coin_price(self.data, coin)
+                if val > top_val:
+                    top_val = val
+                    top_coin = coin
+            if top_coin and top_val > 0:
+                amt = get_holdings(self.data, nick, top_coin)
+                loss = round(amt * pct / 100, 4)
+                set_holdings(self.data, nick, top_coin, amt - loss)
+                dn = display_nick(self.data, top_coin)
+                await self.privmsg(channel,
+                    f'{RED}⚠ INVALID COMMAND{C} — lost {RED}{fmt_coins(loss)} ${dn}{C} ({pct:.1f}%) '
+                    f'{GRY}(syntax: $<coin> buy <amount>){C}')
+            else:
+                usd = get_usd(self.data, nick)
+                loss = round(usd * pct / 100, 2)
+                set_usd(self.data, nick, usd - loss)
+                await self.privmsg(channel,
+                    f'{RED}⚠ INVALID COMMAND{C} — lost {RED}{fmt_price(loss)}{C} ({pct:.1f}%) '
+                    f'{GRY}(syntax: $<coin> buy <amount>){C}')
+            return
+
         if cmd == 'help':
             for ln in self.build_help():
                 await self.privmsg(channel, ln)
