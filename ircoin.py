@@ -202,6 +202,42 @@ def tick_jitter(data: dict):
             del data['lines'][nick]
 
 
+def check_rug_pulls(data: dict) -> list[str]:
+    cutoff = int(time.time() - 21 * 86400)
+    rugged = []
+    for nick in list(data['lines'].keys()):
+        if nick in RESERVED:
+            continue
+        hours = data['lines'].get(nick, {})
+        if not hours:
+            continue
+        latest = max(int(k) for k in hours)
+        if latest >= cutoff:
+            continue
+        price = coin_price(data, nick)
+        dn = display_nick(data, nick)
+        losses = []
+        for player, wallet in list(data['wallets'].items()):
+            amt = wallet.get(nick, 0.0)
+            if amt <= 0:
+                continue
+            val = amt * price
+            wallet.pop(nick, None)
+            if val >= 100:
+                pdn = display_nick(data, player)
+                losses.append(f'{B}{pdn}{B} lost {RED}{fmt_price(val)}{C}')
+        data['lines'].pop(nick, None)
+        data['minted'].pop(nick, None)
+        data['available'].pop(nick, None)
+        data['pressure'].pop(nick, None)
+        data['news_boost'].pop(nick, None)
+        lines = [f'{RED}🪦 RUG PULL{C} {B}{ORG}${dn}{C}{B} has been delisted — no activity for 21 days']
+        for l in losses:
+            lines.append(f'  {l}')
+        rugged.extend(lines)
+    return rugged
+
+
 def recalc_staking(data: dict) -> list[dict]:
     holder_counts: dict[str, int] = {}
     for wallet in data['wallets'].values():
@@ -261,7 +297,7 @@ def check_price_drops(data: dict) -> list[tuple[str, float, float, float]]:
 # ---------------------------------------------------------------------------
 
 def _news_context(data: dict) -> dict:
-    all_nicks = [n for n in data['lines'] if n not in RESERVED]
+    all_nicks = [n for n in data['lines'] if n not in RESERVED and total_minted(data, n) >= 10 and total_lines(data, n) >= 50]
     coins_by_price = sorted(all_nicks, key=lambda n: coin_price(data, n), reverse=True)
     coins_by_supply = sorted(all_nicks, key=lambda n: total_minted(data, n), reverse=True)
 
@@ -493,7 +529,23 @@ def build_news(data: dict) -> list[str]:
         color = random.choice([CYN, LGN, YEL, PNK, ORG, BLU])
         lines.append(f' {icon} {color}{B}{h["text"]}{B}{C}')
     lines.append(bar)
-    lines.append(f' {GRY}News affects coin prices for 1-3 hours. Keep an eye on it.{C}')
+    now = time.time()
+    active = []
+    for coin, boost in data.get('news_boost', {}).items():
+        if boost.get('expires', 0) > now:
+            pct = boost['pct']
+            remaining = int((boost['expires'] - now) / 60)
+            dn = display_nick(data, coin)
+            if pct > 0:
+                tag = f'{GRN}▲ +{pct:.0f}%{C}'
+            else:
+                tag = f'{RED}▼ {pct:.0f}%{C}'
+            active.append(f' {ORG}${dn}{C} {tag} {GRY}({remaining}m left){C}')
+    if active:
+        lines.append(f' {B}{CYN}Active Effects:{C}{B}')
+        lines.extend(active)
+    else:
+        lines.append(f' {GRY}No active price effects right now.{C}')
     lines.append(bar)
     return lines
 
@@ -688,6 +740,9 @@ class IRCoinBot(BaseBot):
             if now - self.data.get('staking_last_calc', 0) < 3600:
                 continue
             try:
+                rugs = check_rug_pulls(self.data)
+                for ln in rugs:
+                    await self.privmsg(CHANNEL, ln)
                 recalc_staking(self.data)
                 snapshot_prices(self.data)
                 drops = check_price_drops(self.data)
