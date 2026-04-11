@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# IRCoin Bot - Developed by acidvegas in Python (https://git.supernets.org/acidvegas/ircoin)
 
 import asyncio
 import datetime
