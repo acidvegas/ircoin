@@ -772,7 +772,9 @@ class IRCoinBot(BaseBot):
         hk = hour_key()
         self.data['lines'][nl][hk] = self.data['lines'][nl].get(hk, 0) + 1
 
-        # Mining roll — chatting mines YOUR coin
+        # Mining roll — need 25 lines before coin can exist
+        if total_lines(self.data, nl) < 25:
+            return
         diff = mine_difficulty(self.data, nick)
         if random.randint(1, diff) == 1:
             reward = mine_reward(self.data, nick)
@@ -963,11 +965,13 @@ class IRCoinBot(BaseBot):
             return
 
         cn = coin_nick.lower()
+        apply_pressure(self.data, cn, usd, is_buy=True)
         price = coin_price(self.data, cn)
         coins_wanted = usd / price
         avail = available_supply(self.data, cn)
 
         if avail <= 0:
+            apply_pressure(self.data, cn, usd, is_buy=False)
             dn = display_nick(self.data, cn)
             await self.privmsg(channel,
                 f'{RED}✗{C} No {ORG}${dn}{C} available. They need to chat more to mine supply!')
@@ -981,7 +985,6 @@ class IRCoinBot(BaseBot):
         self.data['available'][cn] = avail - coins_wanted
         cur = get_holdings(self.data, nick, cn)
         set_holdings(self.data, nick, cn, cur + coins_wanted)
-        apply_pressure(self.data, cn, usd, is_buy=True)
 
         dn = display_nick(self.data, cn)
         await self.privmsg(channel,
@@ -991,7 +994,6 @@ class IRCoinBot(BaseBot):
 
     async def cmd_sell(self, nick: str, channel: str, coin_nick: str, amount_str: str):
         cn = coin_nick.lower()
-        price = coin_price(self.data, cn)
         held = get_holdings(self.data, nick, cn)
 
         if amount_str == '*':
@@ -1001,7 +1003,8 @@ class IRCoinBot(BaseBot):
                     f'{RED}✗{C} {B}{nick}{B}: No {ORG}${dn}{C} to sell.')
                 return
             coins_to_sell = held
-            usd = coins_to_sell * price
+            apply_pressure(self.data, cn, coins_to_sell * coin_price(self.data, cn), is_buy=False)
+            usd = coins_to_sell * coin_price(self.data, cn)
         else:
             try:
                 usd = float(amount_str)
@@ -1011,19 +1014,22 @@ class IRCoinBot(BaseBot):
             if usd <= 0:
                 await self.privmsg(channel, f'{RED}✗{C} Nice try.')
                 return
+            apply_pressure(self.data, cn, usd, is_buy=False)
+            price = coin_price(self.data, cn)
             coins_to_sell = usd / price
             if coins_to_sell > held:
+                apply_pressure(self.data, cn, usd, is_buy=True)
                 dn = display_nick(self.data, cn)
+                price_orig = coin_price(self.data, cn)
                 await self.privmsg(channel,
                     f'{RED}✗{C} {B}{nick}{B}: Insufficient {ORG}${dn}{C}. '
-                    f'Holding: {LGN}{fmt_coins(held)}{C} ({YEL}{fmt_price(held * price)}{C})')
+                    f'Holding: {LGN}{fmt_coins(held)}{C} ({YEL}{fmt_price(held * price_orig)}{C})')
                 return
 
         set_holdings(self.data, nick, cn, held - coins_to_sell)
         self.data['available'][cn] = self.data['available'].get(cn, 0.0) + coins_to_sell
         cur_usd = get_usd(self.data, nick)
         set_usd(self.data, nick, cur_usd + usd)
-        apply_pressure(self.data, cn, usd, is_buy=False)
 
         dn = display_nick(self.data, cn)
         await self.privmsg(channel,
