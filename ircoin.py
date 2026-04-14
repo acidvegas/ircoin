@@ -3,9 +3,11 @@
 
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import random
+import sqlite3
 import time
 
 SERVER  = 'irc.supernets.org'
@@ -13,7 +15,10 @@ PORT    = 6697
 USE_SSL = True
 CHANNEL = '#superbowl'
 
-DATA_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ircoin_data.json')
+_BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE       = os.path.join(_BASE_DIR, 'ircoin_data.json')
+LEDGER_FILE     = os.path.join(_BASE_DIR, 'ircoin_ledger.db')
+BACKUP_DIR      = os.path.join(_BASE_DIR, 'backups')
 SYNC_INTERVAL   = 300
 JITTER_INTERVAL = 10
 NAMES_INTERVAL  = 60
@@ -47,7 +52,19 @@ LGY = '\x0315'
 PNK = '\x0313'
 BLU = '\x0312'
 
-RESERVED = {'bal', 'top', 'help', 'market', 'rich', 'portfolio', 'staking', 'stake', 'give', 'news'}
+RESERVED = {'bal', 'top', 'help', 'market', 'rich', 'portfolio', 'staking', 'stake', 'give', 'news', 'blockchain'}
+
+MODE = {
+    'maintenance': False,
+    'maintenance_until': 0.0,
+    'fees': False,
+    'fees_until': 0.0,
+    'fee_pct': 0.0,
+    'fee_applies': 'both',  # 'buy', 'sell', or 'both'
+    'last_maintenance': 0.0,
+    'last_fees': 0.0,
+    'fees_today': 0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +100,58 @@ def save_data(data: dict):
     with open(tmp, 'w') as f:
         json.dump(data, f)
     os.replace(tmp, DATA_FILE)
+
+
+import shutil
+
+def backup_data():
+    if not os.path.exists(DATA_FILE):
+        return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tag = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+    dst = os.path.join(BACKUP_DIR, f'ircoin_data_{tag}.json')
+    shutil.copy2(DATA_FILE, dst)
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+    for f in os.listdir(BACKUP_DIR):
+        if not f.startswith('ircoin_data_') or not f.endswith('.json'):
+            continue
+        try:
+            d = datetime.datetime.strptime(f, 'ircoin_data_%Y-%m-%d.json')
+            if d < cutoff:
+                os.remove(os.path.join(BACKUP_DIR, f))
+        except ValueError:
+            pass
+
+
+_ledger_db = None
+
+def init_ledger():
+    global _ledger_db
+    _ledger_db = sqlite3.connect(LEDGER_FILE)
+    _ledger_db.execute('''CREATE TABLE IF NOT EXISTS ledger (
+        ts       REAL,
+        date     TEXT,
+        player   TEXT,
+        action   TEXT,
+        coin     TEXT,
+        coins    REAL,
+        usd      REAL,
+        price    REAL,
+        target   TEXT
+    )''')
+    _ledger_db.execute('PRAGMA journal_mode=WAL')
+    _ledger_db.commit()
+
+
+def log_trade(player: str, action: str, coin: str, coins: float, usd: float, price: float, target: str = None):
+    if _ledger_db is None:
+        return
+    now = time.time()
+    _ledger_db.execute(
+        'INSERT INTO ledger VALUES (?,?,?,?,?,?,?,?,?)',
+        (now, datetime.datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+         player, action, coin, coins, usd, price, target))
+    _ledger_db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +827,78 @@ class IRCoinBot(BaseBot):
             except OSError:
                 pass
 
+    async def mode_loop(self):
+        await asyncio.sleep(60)
+        while True:
+            await asyncio.sleep(60)
+            if not self.writer:
+                continue
+            now = time.time()
+
+            if MODE['maintenance'] and now >= MODE['maintenance_until']:
+                MODE['maintenance'] = False
+                try:
+                    await self.privmsg(CHANNEL,
+                        f'{GRN}━━━{C} {B}{GRN}✓ EXCHANGE ONLINE{C}{B} {GRN}━━━{C} '
+                        f'Maintenance complete. Trading has resumed.')
+                except OSError:
+                    pass
+                continue
+
+            if MODE['fees'] and now >= MODE['fees_until']:
+                MODE['fees'] = False
+                MODE['fee_pct'] = 0.0
+                try:
+                    await self.privmsg(CHANNEL,
+                        f'{GRN}━━━{C} {B}{GRN}✓ FEES DISABLED{C}{B} {GRN}━━━{C} '
+                        f'Fee period has ended. Trading is now fee-free.')
+                except OSError:
+                    pass
+                continue
+
+            if MODE['maintenance'] or MODE['fees']:
+                continue
+
+            day_start = now - (now % 86400)
+
+            if MODE['last_maintenance'] < day_start and random.random() < (1 / 720):
+                MODE['maintenance'] = True
+                MODE['maintenance_until'] = now + 3600
+                MODE['last_maintenance'] = now
+                try:
+                    await self.privmsg(CHANNEL,
+                        f'{RED}━━━{C} {B}{RED}⚠ EXCHANGE MAINTENANCE{C}{B} {RED}━━━{C} '
+                        f'Trading is suspended for {B}1 hour{B}. '
+                        f'{GRY}($give still works){C}')
+                except OSError:
+                    pass
+                continue
+
+            if MODE['fees_today'] < 2 and MODE['last_fees'] < now - 7200 and random.random() < (1 / 480):
+                pct_ranges = [(1, 3), (2, 5), (3, 5)]
+                lo, hi = random.choice(pct_ranges)
+                MODE['fees'] = True
+                MODE['fees_until'] = now + 3600
+                MODE['fee_pct'] = round(random.uniform(lo, hi), 1)
+                MODE['fee_applies'] = random.choice(['buy', 'sell', 'both'])
+                MODE['last_fees'] = now
+                MODE['fees_today'] += 1
+                applies = MODE['fee_applies']
+                if applies == 'both':
+                    applies_str = 'buys & sells'
+                else:
+                    applies_str = f'{applies}s only'
+                try:
+                    await self.privmsg(CHANNEL,
+                        f'{ORG}━━━{C} {B}{ORG}💰 FEE MODE ACTIVE{C}{B} {ORG}━━━{C} '
+                        f'{B}{MODE["fee_pct"]:.1f}%{B} fee on {B}{applies_str}{B} for {B}1 hour{B}. '
+                        f'{GRY}(fees go to the coin minter){C}')
+                except OSError:
+                    pass
+
+            if now - day_start < 120:
+                MODE['fees_today'] = 0
+
     # --- Message handling ---
 
     async def on_privmsg(self, nick: str, channel: str, msg: str):
@@ -883,6 +1024,11 @@ class IRCoinBot(BaseBot):
         if cmd == 'give':
             await self.cmd_give(nick, channel, parts)
             return
+        if cmd == 'blockchain':
+            arg = parts[1] if len(parts) > 1 else None
+            for ln in self.build_blockchain(arg):
+                await self.privmsg(channel, ln)
+            return
 
         # Nick-coin commands: $<nick> [buy|sell <usd>]
         coin_nick = cmd
@@ -899,6 +1045,12 @@ class IRCoinBot(BaseBot):
             return
 
         sub = parts[1].lower()
+        if sub in ('buy', 'sell') and MODE['maintenance']:
+            await self.privmsg(channel,
+                f'{RED}⚠{C} Exchange is down for maintenance. Trading resumes in '
+                f'{B}{max(1, int((MODE["maintenance_until"] - time.time()) / 60))}m{B}. '
+                f'{GRY}($give still works){C}')
+            return
         if sub == 'buy' and len(parts) == 3:
             await self.cmd_buy(nick, channel, coin_nick, parts[2])
         elif sub == 'sell' and len(parts) == 3:
@@ -983,16 +1135,25 @@ class IRCoinBot(BaseBot):
             coins_wanted = avail
             usd = coins_wanted * price
 
+        fee_coins = 0.0
+        if MODE['fees'] and MODE['fee_applies'] in ('buy', 'both'):
+            fee_coins = round(coins_wanted * MODE['fee_pct'] / 100, 4)
+            coins_wanted -= fee_coins
+            minter_held = get_holdings(self.data, cn, cn)
+            set_holdings(self.data, cn, cn, minter_held + fee_coins)
+
         set_usd(self.data, nick, bal - usd)
-        self.data['available'][cn] = avail - coins_wanted
+        self.data['available'][cn] = avail - coins_wanted - fee_coins
         cur = get_holdings(self.data, nick, cn)
         set_holdings(self.data, nick, cn, cur + coins_wanted)
 
         dn = display_nick(self.data, cn)
+        log_trade(nick, 'buy', cn, coins_wanted, usd, price)
+        fee_str = f' {ORG}(fee: {fmt_coins(fee_coins)} → {dn}){C}' if fee_coins > 0 else ''
         await self.privmsg(channel,
             f'{GRN}✓{C} {B}{nick}{B} bought {LGN}{fmt_coins(coins_wanted)}{C} {ORG}${dn}{C} '
             f'for {YEL}{fmt_price(usd)}{C} '
-            f'{GRY}(avail: {fmt_coins(available_supply(self.data, cn))}){C}')
+            f'{GRY}(avail: {fmt_coins(available_supply(self.data, cn))}){C}{fee_str}')
 
     async def cmd_sell(self, nick: str, channel: str, coin_nick: str, amount_str: str):
         cn = coin_nick.lower()
@@ -1028,15 +1189,25 @@ class IRCoinBot(BaseBot):
                     f'Holding: {LGN}{fmt_coins(held)}{C} ({YEL}{fmt_price(held * price_orig)}{C})')
                 return
 
-        set_holdings(self.data, nick, cn, held - coins_to_sell)
+        fee_coins = 0.0
+        if MODE['fees'] and MODE['fee_applies'] in ('sell', 'both'):
+            fee_coins = round(coins_to_sell * MODE['fee_pct'] / 100, 4)
+            coins_to_sell -= fee_coins
+            usd = coins_to_sell * coin_price(self.data, cn)
+            minter_held = get_holdings(self.data, cn, cn)
+            set_holdings(self.data, cn, cn, minter_held + fee_coins)
+
+        set_holdings(self.data, nick, cn, held - coins_to_sell - fee_coins)
         self.data['available'][cn] = self.data['available'].get(cn, 0.0) + coins_to_sell
         cur_usd = get_usd(self.data, nick)
         set_usd(self.data, nick, cur_usd + usd)
 
         dn = display_nick(self.data, cn)
+        log_trade(nick, 'sell', cn, coins_to_sell, usd, coin_price(self.data, cn))
+        fee_str = f' {ORG}(fee: {fmt_coins(fee_coins)} → {dn}){C}' if fee_coins > 0 else ''
         await self.privmsg(channel,
             f'{GRN}✓{C} {B}{nick}{B} sold {LGN}{fmt_coins(coins_to_sell)}{C} {ORG}${dn}{C} '
-            f'for {YEL}{fmt_price(usd)}{C} USD')
+            f'for {YEL}{fmt_price(usd)}{C} USD{fee_str}')
 
     # --- Give ---
 
@@ -1087,6 +1258,7 @@ class IRCoinBot(BaseBot):
 
         dn = display_nick(self.data, coin)
         price = coin_price(self.data, coin)
+        log_trade(nick, 'give', coin, amount, amount * price, price, target=target)
         await self.privmsg(channel,
             f'{GRN}✓{C} {B}{nick}{B} sent {LGN}{fmt_coins(amount)}{C} {ORG}${dn}{C} '
             f'({YEL}{fmt_price(amount * price)}{C}) to {B}{target}{B}')
@@ -1280,6 +1452,88 @@ class IRCoinBot(BaseBot):
         result.append(
             f' {CYN}Coins:{C} {B}{all_coins_count}{B} '
             f'{GRY}│{C} {CYN}Total MCap:{C} {B}{YEL}{fmt_price(total_mcap)}{C}{B}')
+        if MODE['maintenance']:
+            mins = max(1, int((MODE['maintenance_until'] - time.time()) / 60))
+            result.append(
+                f' {RED}⚠ MAINTENANCE MODE{C} — trading suspended {GRY}({mins}m remaining){C}')
+        elif MODE['fees']:
+            mins = max(1, int((MODE['fees_until'] - time.time()) / 60))
+            applies = MODE['fee_applies']
+            if applies == 'both':
+                applies = 'buys & sells'
+            else:
+                applies = f'{applies}s'
+            result.append(
+                f' {ORG}💰 FEE MODE{C} — {B}{MODE["fee_pct"]:.1f}%{B} on {applies} '
+                f'{GRY}({mins}m remaining, fees go to minter){C}')
+        result.append(bar)
+        return result
+
+    def build_blockchain(self, arg: str = None) -> list[str]:
+        if _ledger_db is None:
+            return [f'{RED}✗{C} Ledger not initialized.']
+
+        if arg:
+            if arg.startswith('$'):
+                clean = arg[1:].lower()
+                rows = _ledger_db.execute(
+                    'SELECT ts, player, action, coin, coins, usd, price, target '
+                    'FROM ledger WHERE coin=? ORDER BY ts DESC LIMIT 20', (clean,)).fetchall()
+                title = f'${display_nick(self.data, clean)}'
+            else:
+                clean = arg.lower()
+                rows = _ledger_db.execute(
+                    'SELECT ts, player, action, coin, coins, usd, price, target '
+                    'FROM ledger WHERE LOWER(player)=? ORDER BY ts DESC LIMIT 20', (clean,)).fetchall()
+                title = clean
+        else:
+            rows = _ledger_db.execute(
+                'SELECT ts, player, action, coin, coins, usd, price, target '
+                'FROM ledger ORDER BY ts DESC LIMIT 20').fetchall()
+            title = 'Recent'
+
+        bar = f'{YEL}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C}'
+        result = [
+            bar,
+            f' {B}{ORG}IRCoin{C}{B} {YEL}━━━{C} {B}{CYN}Blockchain{C}{B} {GRY}({title} — {len(rows)} txns){C}',
+            bar,
+        ]
+        if not rows:
+            result.append(f' {GRY}No transactions found.{C}')
+        else:
+            hash_colors = [f'\x03{i:02d}' for i in range(2, 99)]
+            parsed = []
+            prev_hash = '0' * 16
+            for ts, player, action, coin, coins, usd, price, target in reversed(rows):
+                raw = f'{ts}{player}{action}{coin}{coins}{usd}{prev_hash}'
+                block_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
+                dt = datetime.datetime.utcfromtimestamp(ts).strftime('%m/%d %H:%M')
+                dn = display_nick(self.data, coin)
+                parsed.append((block_hash, dt, player, action, dn, coins, usd, target))
+                prev_hash = block_hash
+            pn = max(len(r[2]) for r in parsed)
+            pc = max(len(f'${r[4]}') for r in parsed)
+            pa = max(len(fmt_coins(r[5])) for r in parsed)
+            for i, (bh, dt, player, action, dn, coins, usd, target) in enumerate(parsed):
+                hc = random.choice(hash_colors)
+                if action == 'buy':
+                    act = f'{GRN}BUY {C}'
+                elif action == 'sell':
+                    act = f'{RED}SELL{C}'
+                else:
+                    act = f'{CYN}GIVE{C}'
+                amt_str = fmt_coins(coins).rjust(pa)
+                coin_str = f'${dn}'.ljust(pc)
+                if action == 'give':
+                    detail = f'{LGN}{amt_str}{C} {ORG}{coin_str}{C} → {B}{target}{B}'
+                else:
+                    detail = f'{LGN}{amt_str}{C} {ORG}{coin_str}{C} for {YEL}{fmt_price(usd)}{C}'
+                result.append(
+                    f' {hc}{bh[:8]}{C} {GRY}{dt}{C} {B}{player.ljust(pn)}{B} {act} {detail}')
+        result.append(bar)
+        total = _ledger_db.execute('SELECT COUNT(*) FROM ledger').fetchone()[0]
+        latest_hash = prev_hash if rows else '0' * 16
+        result.append(f' {GRY}Total blocks: {total} │ HEAD: {latest_hash}{C}')
         result.append(bar)
         return result
 
@@ -1297,6 +1551,7 @@ class IRCoinBot(BaseBot):
             ('$staking',             'Coins earning staking interest'),
             ('$news',                'Market news — affects prices!'),
             ('$market',              'Full market overview'),
+            ('$blockchain [nick|$coin]', 'Transaction ledger'),
             ('$help',                'This help message'),
         ]
         lines = [
@@ -1311,6 +1566,8 @@ class IRCoinBot(BaseBot):
             f' {CYN}Top 10 most widely held coins earn {B}{LGN}staking interest{C}{B}{CYN} (up to 3%/day)!{C}',
             f' {CYN}Last 30 days of activity affects price {B}3x{B} more than older data.{C}',
             f' {CYN}Everyone starts with {B}{YEL}$1,000 USD{C}{B}{CYN}. Place your bets.{C}',
+            f' {CYN}The exchange randomly goes down for {B}maintenance{B} (1h, no trading, $give still works).{C}',
+            f' {CYN}Random {B}fee mode{B} 1-2x/day for 1h — 1-5% fee on buys, sells, or both → coin minter.{C}',
             bar,
             f' {B}{YEL}{"COMMAND":<27}{GRY}│{C} {B}{YEL}DESCRIPTION{C}{B}',
             div,
@@ -1337,18 +1594,29 @@ async def save_loop(data: dict):
         save_data(data)
 
 
+async def backup_loop(data: dict):
+    while True:
+        await asyncio.sleep(3600)
+        save_data(data)
+        backup_data()
+
+
 async def main():
+    init_ledger()
     data = load_data()
     tick_jitter(data)
     recalc_staking(data)
+    backup_data()
 
     bot = IRCoinBot(data)
     tasks = [
         asyncio.create_task(bot.run()),
         asyncio.create_task(bot.names_loop()),
         asyncio.create_task(bot.staking_loop()),
+        asyncio.create_task(bot.mode_loop()),
         asyncio.create_task(jitter_loop(data)),
         asyncio.create_task(save_loop(data)),
+        asyncio.create_task(backup_loop(data)),
     ]
     try:
         await asyncio.gather(*tasks)
