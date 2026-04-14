@@ -203,9 +203,10 @@ def tick_jitter(data: dict):
             del data['lines'][nick]
 
 
-def check_rug_pulls(data: dict) -> list[str]:
+def check_rug_pulls(data: dict) -> tuple[list[str], set[str]]:
     cutoff = int(time.time() - 21 * 86400)
-    rugged = []
+    msgs = []
+    rugged_nicks = set()
     for nick in list(data['lines'].keys()):
         if nick in RESERVED:
             continue
@@ -232,11 +233,12 @@ def check_rug_pulls(data: dict) -> list[str]:
         data['available'].pop(nick, None)
         data['pressure'].pop(nick, None)
         data['news_boost'].pop(nick, None)
+        rugged_nicks.add(nick)
         lines = [f'{RED}🪦 RUG PULL{C} {B}{ORG}${dn}{C}{B} has been delisted — no activity for 21 days']
         for l in losses:
             lines.append(f'  {l}')
-        rugged.extend(lines)
-    return rugged
+        msgs.extend(lines)
+    return msgs, rugged_nicks
 
 
 def recalc_staking(data: dict) -> list[dict]:
@@ -264,7 +266,7 @@ def snapshot_prices(data: dict):
     data['hourly_prices'] = data['hourly_prices'][-25:]
 
 
-def check_price_drops(data: dict) -> list[tuple[str, float, float, float]]:
+def check_price_drops(data: dict, skip: set[str] | None = None) -> list[tuple[str, float, float, float]]:
     snapshots = data.get('hourly_prices', [])
     if len(snapshots) < 2:
         return []
@@ -282,6 +284,8 @@ def check_price_drops(data: dict) -> list[tuple[str, float, float, float]]:
     drops = []
     announced = data.get('drop_announced', {})
     for coin, old_price in old['prices'].items():
+        if skip and coin in skip:
+            continue
         if old_price <= 0:
             continue
         cur = coin_price(data, coin)
@@ -553,9 +557,7 @@ def build_news(data: dict) -> list[str]:
 
 def known_coin(data: dict, nick: str) -> bool:
     nl = nick.lower()
-    if nl in data['lines'] or nl in data['minted']:
-        return True
-    return nl in [n.lower() for n in data['names']]
+    return nl in data['minted'] or nl in data['lines']
 
 
 # ---------------------------------------------------------------------------
@@ -741,12 +743,12 @@ class IRCoinBot(BaseBot):
             if now - self.data.get('staking_last_calc', 0) < 3600:
                 continue
             try:
-                rugs = check_rug_pulls(self.data)
+                rugs, rugged_nicks = check_rug_pulls(self.data)
                 for ln in rugs:
                     await self.privmsg(CHANNEL, ln)
                 recalc_staking(self.data)
                 snapshot_prices(self.data)
-                drops = check_price_drops(self.data)
+                drops = check_price_drops(self.data, skip=rugged_nicks)
                 for coin, old_p, new_p, pct in drops:
                     dn = display_nick(self.data, coin)
                     await self.privmsg(CHANNEL,
@@ -1253,21 +1255,31 @@ class IRCoinBot(BaseBot):
             rows = []
             for n, p, minted, avail, tl in coins:
                 dn = display_nick(self.data, n)
+                avail_pct = f'{(avail / minted * 100):.0f}%' if minted > 0 else '0%'
                 rows.append((dn, fmt_price(p), fmt_price(p * minted),
-                             fmt_coins(minted), fmt_coins(avail)))
+                             fmt_coins(minted), fmt_coins(avail), avail_pct))
             pn = max(len(r[0]) for r in rows) + 1
             pp = max(len(r[1]) for r in rows)
             pm = max(len(r[2]) for r in rows)
             ps = max(len(r[3]) for r in rows)
             pa = max(len(r[4]) for r in rows)
-            for dn, sp, sm, ss, sa in rows:
+            pk = max(len(r[5]) for r in rows)
+            for dn, sp, sm, ss, sa, sk in rows:
                 result.append(
                     f' {ORG}${dn.ljust(pn)}{C} '
                     f'{YEL}{sp.rjust(pp)}{C} '
                     f'{GRY}│{C} {CYN}MCap:{C} {sm.rjust(pm)} '
                     f'{GRY}│{C} {CYN}Supply:{C} {ss.rjust(ps)} '
-                    f'{GRY}│{C} {CYN}Avail:{C} {LGN}{sa.rjust(pa)}{C}')
+                    f'{GRY}│{C} {CYN}Avail:{C} {LGN}{sa.rjust(pa)}{C} '
+                    f'{GRY}({sk.rjust(pk)}){C}')
 
+        all_coins_count = len([n for n in self.data['lines'] if n not in RESERVED and total_lines(self.data, n) > 0])
+        total_mcap = sum(coin_price(self.data, n) * total_minted(self.data, n)
+                         for n in self.data['lines'] if n not in RESERVED)
+        result.append(bar)
+        result.append(
+            f' {CYN}Coins:{C} {B}{all_coins_count}{B} '
+            f'{GRY}│{C} {CYN}Total MCap:{C} {B}{YEL}{fmt_price(total_mcap)}{C}{B}')
         result.append(bar)
         return result
 
