@@ -3,3 +3,7 @@
 
 ircoin_data.json
 ircoin_data.json.tmp
+ircoin_ledger.db
+ircoin_ledger.db-wal
+ircoin_ledger.db-shm
+backups/
